@@ -6,14 +6,14 @@ name: Release
 # fires no announce, so the reconciler can pin it and publishing comes last.
 #
 # Gates: the tag must sit on the default branch, name exactly the VERSION and manifest
-# version, and point at a commit whose CI workflow runs all succeeded. The default
-# branch is protected by require-ci, so this is a verification, not a re-run. Release
+# version, and have successful default-branch push runs of ci.yml at that exact commit.
+# Other non-release workflows must also finish without failures. Release
 # notes come from docs/release-notes/v<version>.md when it carries a "## Highlights"
 # section with one-line bullets; otherwise GitHub auto-notes, with a warning, because
 # the drop card renders Highlights and falls back to PR titles.
 #
 # Re-runnable: dispatch with the tag to retry a failed stage. An existing draft or
-# published release is never touched. Identical across hov-marketplace plugins.
+# published release is never touched. Based on the hov-marketplace release recipe.
 
 on:
   push:
@@ -86,37 +86,43 @@ jobs:
           RELEASE_SHA: ${{ steps.tag.outputs.release_sha }}
         run: |
           set -euo pipefail
-          # CI on the default branch runs on the same push that auto-release reacts to, so
-          # it may still be in flight when the tag lands. Wait (bounded), then require every
-          # run other than the release plumbing itself to have succeeded.
+          # The required main-push CI may not yet be visible when the tag lands.
+          # Query its workflow identity explicitly; unrelated green runs cannot replace it.
           started=$SECONDS
           deadline=$((SECONDS + 1800))
           while :; do
-            runs="$(gh run list --commit "$RELEASE_SHA" --limit 50 --json name,status,conclusion \
-              --jq '[.[] | select(.name != "Auto release on VERSION bump" and .name != "Release" and .name != "Publish staged release" and .name != "Release train")]')"
-            count="$(jq 'length' <<<"$runs")"
+            ci_pages="$(gh api --method GET --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+              -f "head_sha=$RELEASE_SHA" -f "branch=$DEFAULT_BRANCH" -f event=push -f per_page=100)"
+            ci_runs="$(jq --arg sha "$RELEASE_SHA" --arg branch "$DEFAULT_BRANCH" \
+              '[.[].workflow_runs[] | select(.path == ".github/workflows/ci.yml" and .head_sha == $sha and .head_branch == $branch and .event == "push")]' <<<"$ci_pages")"
+            ci_count="$(jq 'length' <<<"$ci_runs")"
+            ci_pending="$(jq '[.[] | select(.status != "completed")] | length' <<<"$ci_runs")"
+            ci_failed="$(jq '[.[] | select(.status == "completed" and .conclusion != "success")] | length' <<<"$ci_runs")"
+            if [ "$ci_failed" -gt 0 ]; then
+              echo "::error::required ci.yml push run on $DEFAULT_BRANCH at ${RELEASE_SHA:0:8} did not succeed"
+              exit 1
+            fi
+            # Preserve the additional-workflow failure gate, without a 50-run truncation.
+            pages="$(gh api --method GET --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/actions/runs" -f "head_sha=$RELEASE_SHA" -f per_page=100)"
+            runs="$(jq '[.[].workflow_runs[] | select(.name != "Auto release on VERSION bump" and .name != "Release" and .name != "Publish staged release" and .name != "Release train")]' <<<"$pages")"
             pending="$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")"
-            succeeded="$(jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length' <<<"$runs")"
             failed="$(jq -r '[.[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")] | map("\(.name)=\(.conclusion)") | join(", ")' <<<"$runs")"
             if [ -n "$failed" ]; then
               echo "::error::CI on ${RELEASE_SHA:0:8} did not pass: $failed. Fix on $DEFAULT_BRANCH, bump the version again; this tag stays unreleased."
               exit 1
             fi
-            if [ "$count" -gt 0 ] && [ "$pending" -eq 0 ]; then
-              # Zero-run green is failure: a set of skipped/neutral runs proves nothing ran.
-              if [ "$succeeded" -eq 0 ]; then
-                echo "::error::CI on ${RELEASE_SHA:0:8} completed without a single successful run ($count run(s), all skipped or neutral); a release needs a CI run that actually passed"
-                exit 1
-              fi
-              echo "CI green on ${RELEASE_SHA:0:8}: $succeeded of $count workflow run(s) succeeded, none failed or pending"
+            if [ "$ci_count" -gt 0 ] && [ "$ci_pending" -eq 0 ] && [ "$pending" -eq 0 ]; then
+              echo "CI green on ${RELEASE_SHA:0:8}: required ci.yml push on $DEFAULT_BRANCH succeeded; no other workflows failed or remain pending"
               break
             fi
-            if [ "$count" -eq 0 ] && [ $((SECONDS - started)) -ge 180 ]; then
-              echo "::error::no CI workflow run found for ${RELEASE_SHA:0:8} after 3 minutes; a release needs a green CI run on its commit"
+            if [ "$ci_count" -eq 0 ] && [ $((SECONDS - started)) -ge 180 ]; then
+              echo "::error::no ci.yml push run on $DEFAULT_BRANCH for ${RELEASE_SHA:0:8} after 3 minutes"
               exit 1
             fi
             if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::CI on ${RELEASE_SHA:0:8} did not complete within 30 minutes (runs=$count pending=$pending)"
+              echo "::error::CI on ${RELEASE_SHA:0:8} did not complete within 30 minutes"
               exit 1
             fi
             sleep 30
