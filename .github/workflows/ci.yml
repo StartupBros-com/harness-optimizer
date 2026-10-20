@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tests:
+    name: offline tests and package contract
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
+        with:
+          persist-credentials: false
+      - name: Offline tests, including package relocation
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Compile Python sources
+        run: python3 -m compileall -q tests
+      - name: Version and repository identity
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(Path('.claude-plugin/plugin.json').read_text())
+          assert manifest['version'] == Path('VERSION').read_text().strip()
+          assert manifest['name'] == os.environ['GITHUB_REPOSITORY'].split('/')[-1]
+          assert Path('skills', manifest['name'], 'SKILL.md').is_file()
+          print('Version and repository identity match.')
+          PY
